@@ -173,6 +173,10 @@ def main():
     p.add_argument("--seed", type=int)
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument(
+        "--global-attention", choices=["eager", "sdpa", "flash"], default="eager",
+        help="Global layers only; SDPA is auto backend, flash is forced CUDA FlashAttention. Numerical traces may change.",
+    )
+    p.add_argument(
         "--consolidate-step-checks",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -207,6 +211,8 @@ def main():
         "--resume", type=Path, help="Only load your own trusted harness checkpoint"
     )
     args = p.parse_args()
+    if args.global_attention == "flash" and args.device != "cuda":
+        p.error("FlashAttention requires CUDA")
     if not math.isfinite(args.watchdog_s) or args.watchdog_s < 0:
         p.error("--watchdog-s must be a finite nonnegative number")
     if args.watchdog_s:
@@ -345,7 +351,10 @@ def main():
             p.error(
                 "Heldout report must bind this file/document count to full-set zero matches"
             )
-    model = LanguageModel(cfg["model"], artifacts.bytes, artifacts.lengths).to(device)
+    model = LanguageModel(
+        cfg["model"], artifacts.bytes, artifacts.lengths,
+        global_attention=args.global_attention,
+    ).to(device)
     # Use the optimizer selected by the resolved arm configuration.
     optimizer = build_optimizer(model, cfg["optim"])
     stream = BatchStream(train, cfg["run"]["batch_size"], seed)
@@ -375,6 +384,11 @@ def main():
         "torch": torch.__version__,
         "smoke": args.smoke,
         "consolidate_step_checks": args.consolidate_step_checks,
+        "global_attention": args.global_attention,
+        "attention_layer_requests": [
+            "eager" if block.attn.local else args.global_attention
+            for block in model.blocks
+        ],
     }
     if artifacts.normalize_input:
         identity["bpb_policy"] = (

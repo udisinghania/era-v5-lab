@@ -1,13 +1,16 @@
 """Reference GQA/RoPE/SwiGLU MoE with G4-compatible projected byte codes.
 
 Dense untied output head per TSAI review; Kronecker projection is input-only.
-No fused kernels, reversible layers or expert parallelism are claimed.
+Optional global SDPA/Flash kernels are execution choices; eager remains the default.
+Local window/sink attention stays eager. No expert parallelism is claimed.
 """
 
 import math
+from contextlib import nullcontext
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def codec(rows, lengths):
@@ -85,8 +88,10 @@ class RMSNorm(nn.Module):
 
 
 class GQA(nn.Module):
-    def __init__(self, m, layer_index=0):
+    def __init__(self, m, layer_index=0, *, global_attention="eager"):
         super().__init__()
+        if global_attention not in ("eager", "sdpa", "flash"):
+            raise ValueError("global_attention must be eager, sdpa or flash")
         w = m["n_embd"]
         self.nh = m["n_head"]
         self.nkv = m["n_kv_head"]
@@ -100,6 +105,7 @@ class GQA(nn.Module):
         self.rotary_dim = 2 * math.floor(m.get("rotary_fraction", 1.0) * self.d / 2)
         pattern = m.get("attn_pattern", ["G"] * m["n_layer"])
         self.local = pattern[layer_index] == "L"
+        self.attention_backend = "eager" if self.local else global_attention
         self.window = m.get("attn_window") if self.local else None
         self.sink = (
             nn.Parameter(torch.zeros(self.nh, dtype=torch.float32))
@@ -154,18 +160,39 @@ class GQA(nn.Module):
         q = self.rotary(self.q(x).view(b, t, self.nh, self.d).transpose(1, 2))
         k = self.rotary(
             self.k(x).view(b, t, self.nkv, self.d).transpose(1, 2)
-        ).repeat_interleave(self.nh // self.nkv, dim=1)
-        v = (
-            self.v(x)
-            .view(b, t, self.nkv, self.d)
-            .transpose(1, 2)
-            .repeat_interleave(self.nh // self.nkv, dim=1)
         )
+        v = self.v(x).view(b, t, self.nkv, self.d).transpose(1, 2)
+        if self.attention_backend == "eager":
+            heads = self.eager_attention(q, k, v)
+        else:
+            if self.attention_backend == "flash" and x.device.type != "cuda":
+                raise RuntimeError("Forced FlashAttention requires a CUDA device")
+            backend = (
+                sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+                if self.attention_backend == "flash" else nullcontext()
+            )
+            with backend:
+                heads = F.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=self.nh != self.nkv
+                )
+        out = heads.transpose(1, 2).reshape(b, t, w)
+        # Apply the channel gate before mixing heads with the output projection.
+        if self.gate is not None:
+            gate_input = x if self.gate_input == "normalized" else residual
+            if gate_input is None:
+                raise ValueError("Residual gate input requires the pre-norm residual")
+            out = out * torch.sigmoid(self.gate(gate_input))
+        return self.o(out)
+
+    def eager_attention(self, q, k, v):
+        b, _, t, _ = q.shape
+        k = k.repeat_interleave(self.nh // self.nkv, dim=1)
+        v = v.repeat_interleave(self.nh // self.nkv, dim=1)
         logits = q.float() @ k.float().transpose(-2, -1) / math.sqrt(self.d)
-        mask = torch.ones(t, t, dtype=torch.bool, device=x.device).tril()
+        mask = torch.ones(t, t, dtype=torch.bool, device=q.device).tril()
         # Intersect the causal mask with the local window on local layers.
         if self.local:
-            positions = torch.arange(t, device=x.device)
+            positions = torch.arange(t, device=q.device)
             mask = mask & ((positions[:, None] - positions[None, :]) < self.window)
         logits = logits.masked_fill(~mask, float("-inf"))
         # A disabled (-inf) sink takes the exact legacy softmax path. This also
@@ -175,14 +202,7 @@ class GQA(nn.Module):
             a = torch.cat((logits, sink), dim=-1).softmax(-1)[..., :t].to(v.dtype)
         else:
             a = logits.softmax(-1).to(v.dtype)
-        out = (a @ v).transpose(1, 2).reshape(b, t, w)
-        # Apply the channel gate before mixing heads with the output projection.
-        if self.gate is not None:
-            gate_input = x if self.gate_input == "normalized" else residual
-            if gate_input is None:
-                raise ValueError("Residual gate input requires the pre-norm residual")
-            out = out * torch.sigmoid(self.gate(gate_input))
-        return self.o(out)
+        return a @ v
 
 
 class SwiGLU(nn.Module):
@@ -241,11 +261,11 @@ class MoE(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, m, layer_index=0):
+    def __init__(self, m, layer_index=0, *, global_attention="eager"):
         super().__init__()
         self.n1 = RMSNorm(m["n_embd"], m["norm_eps"])
         self.n2 = RMSNorm(m["n_embd"], m["norm_eps"])
-        self.attn = GQA(m, layer_index)
+        self.attn = GQA(m, layer_index, global_attention=global_attention)
         self.moe = MoE(m)
 
     def forward(self, x, valid):
@@ -256,11 +276,13 @@ class Block(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, m, rows, lengths):
+    def __init__(self, m, rows, lengths, *, global_attention="eager"):
         super().__init__()
         self.spec = m
         self.embedding = KE2(rows, lengths, m["n_embd"])
-        self.blocks = nn.ModuleList(Block(m, i) for i in range(m["n_layer"]))
+        self.blocks = nn.ModuleList(
+            Block(m, i, global_attention=global_attention) for i in range(m["n_layer"])
+        )
         self.norm = RMSNorm(m["n_embd"], m["norm_eps"])
         self.mtp_head = (
             nn.Linear(m["n_embd"], m["vocab_size"], bias=False) if m["mtp"] else None
